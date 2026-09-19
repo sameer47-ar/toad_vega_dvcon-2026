@@ -1,0 +1,7 @@
+data
+demo
+pipeline
+stage1_detector
+stage2_scorer
+stage3_selector
+tests

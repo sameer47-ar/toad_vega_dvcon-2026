@@ -1,0 +1,231 @@
+Metadata-Version: 2.1
+Name: taod-vega
+Version: 0.1.0
+Summary: Task-Aware Object Detection with Semantic Relevance Scoring on VEGA/Genesys-2
+Home-page: https://github.com/nitpatna/taod-vega
+Author: Team Voltrons, NIT Patna
+Author-email: rachit@nitpatna.ac.in
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+
+# TAOD-VEGA: Task-Aware Object Detection with Semantic Relevance Scoring
+
+**Team Voltrons — NIT Patna | DVCon India 2026 | Submission 650**
+*Rachit Kumar · Mohd Sameer · Om Vats*
+
+---
+
+## Overview
+
+Conventional object detectors (YOLOv8, Faster-RCNN, SSD) identify *every* object in a scene without understanding intent. For robotics and edge AI, only **one object matters** — the one most relevant to the current task.
+
+**TAOD-VEGA** accepts a natural-language task description alongside an RGB image and outputs the *single most task-appropriate object* in the scene. The system runs entirely on a Genesys-2 FPGA board using the VEGA RISC-V soft-IP processor and a custom CNNA (Convolutional Neural Network Accelerator) RTL core.
+
+> **Example:** Image: kitchen counter with wine glass, cup, plate, fork, bottle.
+> Task: `"Serve a drink"` → **wine_glass** | bbox: (245, 130, 80, 120) | score: 0.94
+
+### Targets
+| Metric | Target | Notes |
+|--------|--------|-------|
+| Latency | < 50 ms | On FPGA (VEGA + CNNA) |
+| Power | < 5 W | Kintex-7 total |
+| Top-1 Accuracy | ≥ 60% | Weighted over 14 tasks |
+
+---
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                        TAOD-VEGA SYSTEM                              │
+│                                                                      │
+│   INPUT: RGB Image (320×320)  +  Task String ("Serve a drink")       │
+│                       │                    │                         │
+│          ┌────────────▼──────────┐         │                         │
+│          │    STAGE 1: DETECT   │         │                         │
+│          │    YOLOv8-nano       │         │                         │
+│          │    INT8 on CNNA RTL  │         │                         │
+│          │    → N detections    │         │                         │
+│          └────────────┬──────────┘         │                         │
+│                       │                    │                         │
+│          ┌────────────▼────────────────────▼──────┐                  │
+│          │         STAGE 2: SCORE                 │                  │
+│          │  TinyBERT Dual-Encoder (INT8, VEGA CPU)│                  │
+│          │  task_emb = encode(task_string)        │                  │
+│          │  obj_emb  = encode(class_label)        │                  │
+│          │  score = α·cos_sim + (1-α)·det_conf    │                  │
+│          └─────────────────┬──────────────────────┘                  │
+│                            │ scored + ranked detections               │
+│          ┌─────────────────▼──────────┐                              │
+│          │     STAGE 3: SELECT       │                              │
+│          │  Top-1 Ranked Selector    │                              │
+│          │  threshold = 0.30         │                              │
+│          └─────────────────┬──────────┘                              │
+│                            │                                          │
+│   OUTPUT: class_label + bbox + relevance_score  (UART / Python)      │
+└──────────────────────────────────────────────────────────────────────┘
+
+HARDWARE STACK (Genesys-2 Kintex-7 XC7K325T):
+  ┌──────────────────────────────────────────┐
+  │  VEGA RISC-V (RV32IM)  ←→  CNNA RTL     │
+  │    cnna_driver.c            cnna_top.v   │
+  │    yolov8_runtime.c         systolic_array.v (16×16 INT8)
+  │    tinybert_runtime.c       axi4_dma.v   │
+  │    nms_fixed.c              csr_regbank.v│
+  │                             weight_buffer.v (512 KB BRAM)
+  │                             activ_buffer.v (256 KB ping-pong)
+  └──────────────────────────────────────────┘
+```
+
+---
+
+## Quick Start
+
+```bash
+# 1. Clone and install
+git clone https://github.com/nitpatna/taod-vega
+cd taod-vega
+pip install -e .
+
+# 2. Run the CLI demo (downloads YOLOv8n + TinyBERT automatically)
+python demo/cli_demo.py --image data/sample_images/kitchen.jpg \
+                        --task "Serve a drink"
+
+# 3. Launch the Gradio web demo
+python demo/app.py
+# → Open http://localhost:7860
+
+# 4. Run all unit tests
+pytest tests/ -v --tb=short
+
+# 5. Full 14-task benchmark (requires COCO val2017)
+python data/download_coco.py --dest data/
+python demo/cli_demo.py --benchmark \
+  --coco-val-dir data/val2017 \
+  --coco-ann-file data/annotations/instances_val2017.json
+```
+
+---
+
+## Repository Structure
+
+```
+taod_vega/
+├── configs/
+│   ├── model_config.yaml       YOLOv8n + TinyBERT hyperparameters
+│   ├── fpga_config.yaml        FPGA resource targets
+│   └── tasks_config.yaml       14-task benchmark definitions
+├── data/
+│   ├── download_coco.py        COCO 2017 val downloader
+│   └── task_annotations.json  14-task ↔ COCO category mapping
+├── stage1_detector/
+│   ├── yolov8_detector.py      YOLOv8n wrapper (320×320, INT8)
+│   ├── quantize_int8.py        ONNX INT8 post-training quantisation
+│   └── nms_postprocess.py      Pure-NumPy + fixed-point NMS
+├── stage2_scorer/
+│   ├── dual_encoder.py         TinyBERT dual-encoder + alpha scoring
+│   ├── custom_transformer.py   Lightweight 2-layer transformer (<2M params)
+│   ├── relevance_score.py      Alpha-weighted score fusion utilities
+│   └── train_scorer.py         Fine-tuning on 14-task dataset
+├── stage3_selector/
+│   └── ranked_selector.py      Top-1 selection with threshold
+├── pipeline/
+│   ├── taod_pipeline.py        End-to-end 3-stage pipeline
+│   ├── benchmark.py            14-task COCO accuracy benchmark
+│   └── latency_profiler.py     Per-stage latency + throughput
+├── fpga/
+│   ├── rtl/                    Synthesisable Verilog (Vivado 2023.x)
+│   │   ├── cnna_top.v          CNNA top-level
+│   │   ├── systolic_array.v    16×16 INT8 MAC systolic array
+│   │   ├── weight_buffer.v     512 KB BRAM weight cache
+│   │   ├── activation_buffer.v 256 KB double-buffer SRAM
+│   │   ├── axi4_dma.v          AXI4 burst DMA engine
+│   │   ├── csr_regbank.v       AXI4-Lite CSR register bank
+│   │   └── relu_batchnorm.v    Fused ReLU + BN
+│   ├── tb/                     Testbenches (VCD → GTKWave)
+│   ├── constraints/            XDC timing/IO constraints
+│   └── scripts/                Vivado synthesis + impl TCL
+├── vega_sw/baremetal/          RISC-V C firmware (no stdlib)
+│   ├── main.c                  Boot entry point
+│   ├── cnna_driver.{c,h}       CSR register driver
+│   ├── yolov8_runtime.c        Layer dispatch to CNNA
+│   ├── nms_fixed.c             Q8.8 fixed-point NMS
+│   └── tinybert_runtime.c      INT8 TinyBERT inference
+├── demo/
+│   ├── app.py                  Gradio web demo
+│   ├── cli_demo.py             Command-line interface
+│   └── visualize_output.py     Bounding box overlay
+└── tests/                      Pytest suite (5 integration tests)
+```
+
+---
+
+## Benchmark Results
+
+*(Placeholder — run `taod-benchmark` with COCO val2017 to populate)*
+
+| Task | Top-1 Acc | Primary Hits | Fallback Hits | Total |
+|------|-----------|-------------|--------------|-------|
+| Serve a drink | — | — | — | — |
+| Cut something | — | — | — | — |
+| Sit down | — | — | — | — |
+| Eat food | — | — | — | — |
+| Check the time | — | — | — | — |
+| Read something | — | — | — | — |
+| Take a photo | — | — | — | — |
+| Pour liquid | — | — | — | — |
+| Cook food | — | — | — | — |
+| Play a sport | — | — | — | — |
+| Travel somewhere | — | — | — | — |
+| Carry something | — | — | — | — |
+| Look at something | — | — | — | — |
+| Clean something up | — | — | — | — |
+| **OVERALL** | **≥60%** | — | — | — |
+
+---
+
+## Hardware Deployment
+
+### FPGA Synthesis (Vivado 2023.x)
+
+```tcl
+# In Vivado Tcl Console or batch mode:
+source fpga/scripts/vivado_synth.tcl
+source fpga/scripts/vivado_impl.tcl
+```
+
+Target utilisation on XC7K325T:
+
+| Resource | Target | Notes |
+|----------|--------|-------|
+| LUT | < 70% | 16×16 systolic array |
+| DSP48 | < 80% | INT8 MAC units |
+| BRAM | < 75% | 512 KB weight + 256 KB activation |
+| Fmax | ≥ 100 MHz | 10 ns clock period |
+
+### VEGA Firmware
+
+```bash
+cd vega_sw/
+make all          # Cross-compile with riscv32-unknown-elf-gcc
+make disasm       # Generate .asm listing
+make simulate     # Spike ISA simulator
+make flash        # JTAG programming via OpenOCD
+```
+
+---
+
+## Reference
+
+Sawatzky, J., Schneider, C., Schäfer, H., & Gall, J. (2019).
+**What Object Should I Use? — Task Driven Object Detection.**
+*IEEE/CVF CVPR 2019.* [arXiv:1904.03000](https://arxiv.org/abs/1904.03000)
+
+---
+
+## License
+
+MIT © 2025 Team Voltrons, NIT Patna

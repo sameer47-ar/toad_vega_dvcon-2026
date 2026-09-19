@@ -1,0 +1,3 @@
+[console_scripts]
+taod-benchmark = pipeline.benchmark:main
+taod-demo = demo.cli_demo:main
